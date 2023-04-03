@@ -327,6 +327,7 @@ def load_text(args, source_fp, target_fp, device):
         for i, s in enumerate(segs):
             if (i % 2 == 0):
                 segments_ids += s * [0]
+            else:
                 segments_ids += s * [1]
 
         src = torch.tensor(src_subtoken_idxs)[None, :].to(device)

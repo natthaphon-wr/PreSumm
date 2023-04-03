@@ -297,6 +297,7 @@ def train_single_ext(args, device_id):
 
 
 def test_text_ext(args):
+    logger.info('Test Text Mode')
     logger.info('Loading checkpoint from %s' % args.test_from)
     checkpoint = torch.load(args.test_from, map_location=lambda storage, loc: storage)
     opt = vars(checkpoint['opt'])

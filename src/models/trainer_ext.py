@@ -475,7 +475,7 @@ class Trainer(object):
                 with torch.no_grad():
                     for batch in test_iter:
                         src = batch.src
-                        #labels = batch.src_sent_labels
+                        # labels = batch.src_sent_labels
                         segs = batch.segs
                         clss = batch.clss
                         mask = batch.mask_src
@@ -555,26 +555,31 @@ class Trainer(object):
                                 save_pred.write(pred[i].strip() + '\n')
                             r_can.write(pred[i].strip() + '\n')
 
-                        rouges_per_doc = test_rouge(self.args.temp_dir, report_path_can, report_path_gold)        
-                        result_doc['rouge-1'] = rouges_per_doc['rouge_1_f_score']
-                        result_doc['rouge-2'] = rouges_per_doc['rouge_2_f_score']
-                        result_doc['rouge-l'] = rouges_per_doc['rouge_l_f_score']
-                        result_total = result_total.append(result_doc)
+                        if(self.args.mode == 'test_text'):
+                           break
+                        else: 
+                            rouges_per_doc = test_rouge(self.args.temp_dir, report_path_can, report_path_gold)        
+                            result_doc['rouge-1'] = rouges_per_doc['rouge_1_f_score']
+                            result_doc['rouge-2'] = rouges_per_doc['rouge_2_f_score']
+                            result_doc['rouge-l'] = rouges_per_doc['rouge_l_f_score']
+                            result_total = result_total.append(result_doc)
                         break   
-                            
-        result_mean = result_total.mean(axis=0) # Calculate mean of each metrics
-        # save dataframe to csv
-        report_path = '%s_report.csv' %(self.args.result_path)
-        result_total.to_csv(report_path, sep=',', index=False)
+
+                    
+        
         if (step != -1 and self.args.report_rouge):
+            result_mean = result_total.mean(axis=0) # Calculate mean of each metrics
+            report_path = '%s_report.csv' %(self.args.result_path)
+            result_total.to_csv(report_path, sep=',', index=False)
+
+            logger.info('Evaluation Metrics in Produced Summary: ')
+            for i, v in result_mean.items():
+                logger.info('     %s = %f' %(i, v))
+                    
             rouges = test_rouge(self.args.temp_dir, can_path, gold_path)
             logger.info('Rouges at step %d \n%s' % (step, rouge_results_to_str(rouges)))
            
-        self._report_step(0, step, valid_stats=stats)
-
-        logger.info('Evaluation Metrics in Produced Summary: ')
-        for i, v in result_mean.items():
-            logger.info('     %s = %f' %(i, v))
+            self._report_step(0, step, valid_stats=stats)
         
         return stats
 

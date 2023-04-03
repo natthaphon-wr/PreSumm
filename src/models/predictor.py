@@ -167,8 +167,6 @@ class Translator(object):
                         #     else:
                         #         _pred_str = can_pred_str
 
-
-
                         pred_str = ' '.join(pred_str.split()[:len(gold_str.split())])
 
                     self.can_out_file.write(pred_str + '\n')

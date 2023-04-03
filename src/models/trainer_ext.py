@@ -475,7 +475,7 @@ class Trainer(object):
                 with torch.no_grad():
                     for batch in test_iter:
                         src = batch.src
-                        labels = batch.src_sent_labels
+                        #labels = batch.src_sent_labels
                         segs = batch.segs
                         clss = batch.clss
                         mask = batch.mask_src
@@ -492,14 +492,16 @@ class Trainer(object):
                         else:
                             sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
 
-                            loss = self.loss(sent_scores, labels.float())
-                            loss = (loss * mask.float()).sum()
-                            batch_stats = Statistics(float(loss.cpu().data.numpy()), n_docs = len(labels))
-                            stats.update(batch_stats)
-
                             sent_scores = sent_scores + mask.float()
                             sent_scores = sent_scores.cpu().data.numpy()
                             selected_ids = np.argsort(-sent_scores, 1) #sort sent_scores descending -> candidate sentences
+
+                            if (hasattr(batch, 'src_sent_labels')):
+                                labels = batch.src_sent_labels
+                                loss = self.loss(sent_scores, labels.float())
+                                loss = (loss * mask.float()).sum()
+                                batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
+                                stats.update(batch_stats)
 
                         for i, idx in enumerate(selected_ids): #loop each document
 

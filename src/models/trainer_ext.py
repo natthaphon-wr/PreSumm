@@ -464,6 +464,7 @@ class Trainer(object):
                                               'unique_trigrams_ratio', 
                                               'nid',
                                               'rouge-1','rouge-2','rouge-l'])
+        
         report_path_can= '%stmp.candidate' % (self.args.result_path)
         report_path_gold= '%stmp.gold' % (self.args.result_path)
         gold_path = '%stmp.gold' % (self.args.result_path)
@@ -555,19 +556,18 @@ class Trainer(object):
                                 save_pred.write(pred[i].strip() + '\n')
                             r_can.write(pred[i].strip() + '\n')
 
-                        if(self.args.mode == 'test_text'):
-                           break
-                        else: 
+                        if not (self.args.mode == 'test_text' and self.args.text_tgt == ''):
                             rouges_per_doc = test_rouge(self.args.temp_dir, report_path_can, report_path_gold)        
                             result_doc['rouge-1'] = rouges_per_doc['rouge_1_f_score']
                             result_doc['rouge-2'] = rouges_per_doc['rouge_2_f_score']
                             result_doc['rouge-l'] = rouges_per_doc['rouge_l_f_score']
                             result_total = result_total.append(result_doc)
-                        break   
+                            
+                           
 
                     
         
-        if (step != -1 and self.args.report_rouge):
+        if (self.args.report_rouge and not (self.args.mode == 'test_text' and self.args.text_tgt == '')):
             result_mean = result_total.mean(axis=0) # Calculate mean of each metrics
             report_path = '%s_report.csv' %(self.args.result_path)
             result_total.to_csv(report_path, sep=',', index=False)
@@ -577,9 +577,13 @@ class Trainer(object):
                 logger.info('     %s = %f' %(i, v))
                     
             rouges = test_rouge(self.args.temp_dir, can_path, gold_path)
-            logger.info('Rouges at step %d \n%s' % (step, rouge_results_to_str(rouges)))
+            if step != -1:
+                logger.info('Rouges at step %d \n%s' % (step, rouge_results_to_str(rouges)))
+                self._report_step(0, step, valid_stats=stats)
+
+            else: 
+                logger.info('Rouges: \n%s' % rouge_results_to_str(rouges))
            
-            self._report_step(0, step, valid_stats=stats)
         
         return stats
 

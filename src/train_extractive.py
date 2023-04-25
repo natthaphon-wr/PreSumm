@@ -224,9 +224,6 @@ def lambda_tuned_ext(args, device_id, pt, step):
     model = ExtSummarizer(args, device, checkpoint)
     model.eval()
 
-    # test_iter = data_loader.Dataloader(args, load_dataset(args, 'test', shuffle=False),
-    #                                    args.test_batch_size, device,
-    #                                    shuffle=False, is_test=True)
     trainer = build_trainer(args, device_id, model, None)
     trainer.lambda_tuned_ext(lambda_iter_fct, step)
 
@@ -265,17 +262,6 @@ def train_single_ext(args, device_id):
                 setattr(args, k, opt[k])
     else:
         checkpoint = None
-
-    # def get_posweight(datasets):
-    #     total_num=0
-    #     total_pos=0
-    #     for dataset in datasets:
-    #         for i in dataset:
-    #             total_num+=len(i['src_sent_labels'])
-    #             total_pos+=sum(i['src_sent_labels'])
-
-    #     print('====Compute pos weight done! There are %d sentences in total, with %d sentences as positive===='%(total_num,total_pos))
-    #     return torch.FloatTensor([(total_num-total_pos)/float(total_pos)])
     
     def train_iter_fct():
         # if is_test=False document'text is not included in data_loader

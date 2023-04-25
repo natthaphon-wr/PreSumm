@@ -326,9 +326,6 @@ class Trainer(object):
 
     def _save(self, step):
         real_model = self.model
-        # real_generator = (self.generator.module
-        #                   if isinstance(self.generator, torch.nn.DataParallel)
-        #                   else self.generator)
 
         model_state_dict = real_model.state_dict()
         # generator_state_dict = real_generator.state_dict()

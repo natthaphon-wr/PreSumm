@@ -1,5 +1,5 @@
 import os
-import rouge
+#import rouge
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -18,7 +18,9 @@ import distributed
 from models.reporter_ext import ReportMgr, Statistics
 from others.logging import logger
 from others.utils import test_rouge, rouge_results_to_str
+
 from datetime import datetime
+from tqdm import tqdm
 
 def _tally_parameters(model):
     n_params = sum([p.nelement() for p in model.parameters()])
@@ -137,12 +139,12 @@ class Trainer(object):
         normalization = 0
         
 
-        total_stats = Statistics()
-        report_stats = Statistics()
+        total_stats = Statistics(is_mmr_select_plus = self.args.mmr_select_plus)
+        report_stats = Statistics(is_mmr_select_plus = self.args.mmr_select_plus)
         self._start_report_manager(start_time=total_stats.start_time)
 
         if self.args.mmr_select_plus:
-            train_iter, self.__posweight = train_iter_fct()
+            train_iter = train_iter_fct()
             sentenceModel = SentenceTransformer('bert-base-nli-stsb-mean-tokens')
         else: 
             sentenceModel = None
@@ -155,7 +157,6 @@ class Trainer(object):
 
                     true_batchs.append(batch)
                     normalization += batch.batch_size
-
                     accum += 1
                     if accum == self.grad_accum_count:
                         reduce_counter += 1
@@ -171,18 +172,21 @@ class Trainer(object):
                         report_stats = self._maybe_report_training(
                             step, train_steps,
                             self.optim.learning_rate,
-                            report_stats)
+                            report_stats,is_mmr_select_plus = self.args.mmr_select_plus)
 
                         true_batchs = []
                         accum = 0
+                        
                         normalization = 0
                         if (step % self.save_checkpoint_steps == 0 and self.gpu_rank == 0):
                             self._save(step)
-
+                        
                         step += 1
                         if step > train_steps:
                             break
+
             train_iter = train_iter_fct()
+
 
         return total_stats
 
@@ -194,9 +198,9 @@ class Trainer(object):
         """
         # Set model in validating mode.
         self.model.eval()
-        stats = Statistics()
-
+        stats = Statistics(is_mmr_select_plus = self.args.mmr_select_plus)
         with torch.no_grad():
+            if self.args.mmr_select_plus:  sentenceModel = SentenceTransformer('bert-base-nli-stsb-mean-tokens')
             for batch in valid_iter:
                 src = batch.src
                 labels = batch.src_sent_labels
@@ -206,11 +210,49 @@ class Trainer(object):
                 mask_cls = batch.mask_cls
 
                 sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
+                
+                
+                if self.args.mmr_select_plus:
+                    sent_scores_np = sent_scores.cpu().data.numpy()
+                    selected_ids = np.argsort(-sent_scores_np, 1)
+                    sent_scores_np = -np.sort(-sent_scores_np, 1)
+                    allSentences_list = []
+                    for i, idx in enumerate(selected_ids):
+                        allSentences = []
+                        if (len(batch.src_str[i]) == 0): continue
+                        for j in selected_ids[i][:len(batch.src_str[i])]: #loop each candidate sentence 
+                            if (j >= len(batch.src_str[i])): continue
+                            candidate = batch.src_str[i][j].strip() 
+                            allSentences.append(candidate)
+                        allSentences_list.append(allSentences)
+                    reward,rl_label = self._loss_compute(allSentences_list,sent_scores_np,batch.tgt_str,sent_scores.size(),sentenceModel)
+                    if torch.cuda.is_available(): 
+                        rl_label = rl_label.to(self.gpu_rank)
+                        reward = reward.reshape(sent_scores.shape[0], 1)
+                        reward = reward.to(self.gpu_rank)
+                    else: reward = reward.reshape(sent_scores.shape[0], 1)
 
-                loss = self.loss(sent_scores, labels.float())
-                loss = (loss * mask.float()).sum()
-                batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
+                    labels_float = labels.float()
+                    mask_new = labels.gt(-1).float()
+                    
+                    loss_ce = F.binary_cross_entropy(sent_scores,labels_float,weight = mask_new,reduction='sum')                
+                    mask_new = mask_new*reward
+                    loss_rd = F.binary_cross_entropy(sent_scores,rl_label,weight = mask_new,reduction='sum')
+                    gamma = self.args.gamma
+
+                    loss = (1-gamma)*loss_ce+gamma*loss_rd
+                    batch_stats = Statistics(loss = float(loss.cpu().data.numpy()),
+                                            loss_ce = float(loss_ce.cpu().data.numpy()),
+                                            loss_rd = float(loss_rd.cpu().data.numpy()),
+                                            n_docs = len(labels),is_mmr_select_plus = True) # normalization is n_docs
+                    
+                    
+                else: 
+                    loss = self.loss(sent_scores, labels.float())
+                    loss = (loss * mask.float()).sum()
+                    batch_stats = Statistics(float(loss.cpu().data.numpy()), n_docs = len(labels))
                 stats.update(batch_stats)
+                
             self._report_step(0, step, valid_stats=stats)
             return stats
         
@@ -218,24 +260,29 @@ class Trainer(object):
         self.model.eval()
         stats = Statistics()
         sentenceModel = SentenceTransformer('bert-base-nli-stsb-mean-tokens')
-        can_path = '%slambda_tuned_ext.candidate' % (self.args.result_path)
-        gold_path = '%slambda_tuned_ext.gold' % (self.args.result_path)
+        
         result_path = '%slambda_tuned_ext_report.txt' % (self.args.result_path)
+        logger.info(f'lambda_tuned_ext_report.txt: {result_path}')
         now = datetime.now()
         current_time = now.strftime("%m/%d/%Y, %H:%M:%S")
         with open(result_path, 'a') as f:
             f.write(f'lambda_tuned_ext_{current_time}\n')
-        logger.info(f'can_path {can_path}')
-        logger.info(f'gold_path {gold_path}')
-        for l in range(0,2,1):
+
+        for l in range(0,10+1,1):
             redun_total = pd.DataFrame(columns = ['unique_unigrams_ratio', 'unique_bigrams_ratio', 'unique_trigrams_ratio', 'nid'])
-            lamb = (l*6)/10
+            lamb = l/10
+            
+            can_path = '%slambda_tuned_ext_%s.candidate' % (self.args.result_path,l)
+            gold_path = '%slambda_tuned_ext_%s.gold' % (self.args.result_path,l)
+            logger.info(f'can_path {can_path}')
+            logger.info(f'gold_path {gold_path}')
             logger.info(f'lambda_tuned_ext start lambda {lamb}')
             test_iter = test_iter_fct()
             with open(can_path, 'w') as save_pred:
                 with open(gold_path, 'w') as save_gold:
                     with torch.no_grad():
-                        for batch in test_iter:
+                        for batch in tqdm(test_iter,total=13368-1):
+                            
                             gold = []
                             pred = []
                             src = batch.src
@@ -249,13 +296,12 @@ class Trainer(object):
                             loss = self.loss(sent_scores, labels.float())
                             loss = (loss * mask.float()).sum()
 
-                            batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
+                            batch_stats = Statistics(float(loss.cpu().data.numpy()), n_docs = len(labels))
                             stats.update(batch_stats)
 
                             sent_scores = sent_scores + mask.float()
                             sent_scores = sent_scores.cpu().data.numpy()
                             selected_ids = np.argsort(-sent_scores, 1)
-
                             
                             for i, idx in enumerate(selected_ids):
                                 _pred = self.__mmr_select_test(batch,i,idx,sentenceModel,sent_scores,lamb)
@@ -263,6 +309,7 @@ class Trainer(object):
                                 
                                 pred.append(_pred)
                                 gold.append(batch.tgt_str[i])
+
                             
                             for i in range(len(gold)):
                                 save_gold.write(gold[i].strip() + '\n')
@@ -271,20 +318,21 @@ class Trainer(object):
                             # print(pred)
                             redun_doc = self.cal_redun(pred)
                             redun_total = redun_total.append(redun_doc)
-
+                            
             redun_mean = redun_total.mean(axis=0)
             rouges = test_rouge(self.args.temp_dir, can_path, gold_path)
-            with open(result_path, 'a') as f:
-                f.write(f'lambda_tuned_ext start lambda {lamb} \n{rouges}\n')
-                for i, v in redun_mean.items():
-                    f.write(f'{i} = {v}\n')
-                f.write('\n')
-            
             f1 = np.array(rouges['rouge_1_f_score'])
             f2 = np.array(rouges['rouge_2_f_score'])
             fl = np.array(rouges['rouge_l_f_score'])
             avg_fs = np.mean([f1,f2,fl],0)
-            logger.info(avg_fs)
+            logger.info(f'rouge: {rouges}')
+            logger.info(f'avg-rouge: {avg_fs}')
+            with open(result_path, 'a') as f:
+                f.write(f'lambda_tuned_ext start lambda {lamb} avg-rouge {avg_fs} \n{rouges}\n')
+                for i, v in redun_mean.items():
+                    f.write(f'{i} = {v}\n')
+                f.write('\n')
+
             for i, v in redun_mean.items():
                 logger.info('%s = %f' %(i, v))
             
@@ -292,7 +340,7 @@ class Trainer(object):
 
 
     def __mmr_select_test(self,batch,i,idx,sentenceModel,sent_scores,lamb_custom = None):
-                #Append all sentences (not sorted)
+        #Append all sentences (not sorted)
         all_sentences = []
         for j in range(0, len(idx)):
             if (j >= len(batch.src_str[i])):
@@ -304,7 +352,7 @@ class Trainer(object):
         all_emb = sentenceModel.encode(all_sentences, show_progress_bar = False)
         all_emb = torch.FloatTensor(all_emb)
         all_emb_unsq = all_emb.unsqueeze(2) #torch.size([no.sent, 768, 1]) 
-
+        
         #Sentence Selection
         if self.args.mode == 'lambda_tuned':
             lamb = lamb_custom
@@ -313,7 +361,6 @@ class Trainer(object):
         _pred = [] 
         mmr_selected_ids = []                            
         summ_emb = [] 
-
         while len(mmr_selected_ids) <= len(all_sentences[i]):  #loop for argmax of mmr-score
             j = idx[0]                      #index of most sentence score 
             _pred.append(all_sentences[j])  #append sentence to summary
@@ -332,6 +379,7 @@ class Trainer(object):
 
             if (not self.args.recall_eval) and len(_pred) == 3:
                 return _pred
+        
             
     # Calculate unique ngrams ratio of a document
     def unique_ngrams_ratio(self,pred, n):
@@ -402,21 +450,26 @@ class Trainer(object):
             return False
         
         
-        
-
         if (not cal_lead and not cal_oracle):
             self.model.eval()
-        stats = Statistics()
+        # stats = Statistics()
         # Set sentence embedding model
         if(self.args.mmr_select):
             sentenceModel = SentenceTransformer('bert-base-nli-stsb-mean-tokens')
         logger.info(f'test start')
 
-        # Redundancy result dataframe 
-        redun_total = pd.DataFrame(columns = ['unique_unigrams_ratio', 'unique_bigrams_ratio', 'unique_trigrams_ratio', 'nid'])
-
+        # Result dataframe 
+        result_total = pd.DataFrame(columns = ['unique_unigrams_ratio', 
+                                              'unique_bigrams_ratio', 
+                                              'unique_trigrams_ratio', 
+                                              'nid',
+                                              'rouge-1','rouge-2','rouge-l'])
+        report_path_can= '%stmp.candidate' % (self.args.result_path)
+        report_path_gold= '%stmp.gold' % (self.args.result_path)
+        gold_path = '%stmp.gold' % (self.args.result_path)
         can_path = '%s_step%d.candidate' % (self.args.result_path, step)
         gold_path = '%s_step%d.gold' % (self.args.result_path, step)
+        report_path = '%sreport_all_doc.text' % (self.args.result_path)
         with open(can_path, 'w') as save_pred:
             with open(gold_path, 'w') as save_gold:
                 with torch.no_grad():
@@ -439,10 +492,10 @@ class Trainer(object):
                         else:
                             sent_scores, mask = self.model(src, segs, clss, mask, mask_cls)
 
-                            loss = self.loss(sent_scores, labels.float())
-                            loss = (loss * mask.float()).sum()
-                            batch_stats = Statistics(float(loss.cpu().data.numpy()), len(labels))
-                            stats.update(batch_stats)
+                            # loss = self.loss(sent_scores, labels.float())
+                            # loss = (loss * mask.float()).sum()
+                            # batch_stats = Statistics(float(loss.cpu().data.numpy()), n_docs = len(labels))
+                            # stats.update(batch_stats)
 
                             sent_scores = sent_scores + mask.float()
                             sent_scores = sent_scores.cpu().data.numpy()
@@ -453,11 +506,11 @@ class Trainer(object):
                             if (len(batch.src_str[i]) == 0):
                                 continue
                             
-                            if(self.args.mmr_select):                        
+                            if(self.args.mmr_select):                      
                                 _pred = self.__mmr_select_test(batch,i,idx,sentenceModel,sent_scores)
                                 
                             elif(self.args.block_trigram):
-                                
+                                _pred = []
                                 for j in selected_ids[i][:len(batch.src_str[i])]:
                                     if (j >= len(batch.src_str[i])):
                                         continue
@@ -488,27 +541,42 @@ class Trainer(object):
                         
 
                         #Calulate redundancy metrics
-                        redun_doc = self.cal_redun(pred)
-                        redun_total = redun_total.append(redun_doc)
+                        result_doc = self.cal_redun(pred)
+                    
+                        with open(report_path_gold, 'w') as r_gold:
+                            for i in range(len(gold)):
+                                save_gold.write(gold[i].strip() + '\n')
+                            r_gold.write(gold[i].strip() + '\n')
 
-                        for i in range(len(gold)):
-                            save_gold.write(gold[i].strip() + '\n')
-                        for i in range(len(pred)):
-                            save_pred.write(pred[i].strip() + '\n')
-        redun_mean = redun_total.mean(axis=0) # Calculate mean of each redundancy metrics
-        
+                        with open(report_path_can, 'w') as r_can:
+                            for i in range(len(pred)):
+                                save_pred.write(pred[i].strip() + '\n')
+                            r_can.write(pred[i].strip() + '\n')
+
+                        rouges_per_doc = test_rouge(self.args.temp_dir, report_path_can, report_path_gold)        
+                        result_doc['rouge-1'] = rouges_per_doc['rouge_1_f_score']
+                        result_doc['rouge-2'] = rouges_per_doc['rouge_2_f_score']
+                        result_doc['rouge-l'] = rouges_per_doc['rouge_l_f_score']
+                        result_total = result_total.append(result_doc)
+                        break   
+                            
+        result_mean = result_total.mean(axis=0) # Calculate mean of each metrics
+        # save dataframe to csv
+        report_path = '%s_report.csv' %(self.args.result_path)
+        result_total.to_csv(report_path, sep=',', index=False)
         if (step != -1 and self.args.report_rouge):
             rouges = test_rouge(self.args.temp_dir, can_path, gold_path)
             logger.info('Rouges at step %d \n%s' % (step, rouge_results_to_str(rouges)))
            
-        self._report_step(0, step, valid_stats=stats)
+        # self._report_step(0, step, valid_stats=stats)
 
-        logger.info('Evaluation of Redundancy in Produced Summary: ')
-        for i, v in redun_mean.items():
+        logger.info('Evaluation Metrics in Produced Summary: ')
+        for i, v in result_mean.items():
             logger.info('     %s = %f' %(i, v))
         
-        return stats
+        # return stats
 
+    # Greedy method for loss calculation
     def _greedy_nommr(self, sent_scores,allSentences):
         selected = []
         summary=[]
@@ -526,22 +594,26 @@ class Trainer(object):
             selected.append(selected_j)
         return summary, selected
 
+    # mmr-select method for loss calculation
     def _mmr_select(self, sent_scores,allSentences,sentenceModel):
         selected = []
         summary=[]
-        lamb = 0.6
+        lamb = self.args.lamb
+
         sent_limit = 3
-        scores = sent_scores
+        
         for idi, i  in  enumerate(sent_scores):
+            scores_importance = i[:len(allSentences[idi])].copy()
+            scores = scores_importance.copy()
             selected_j = []
             summary_j = []
             sent_limit = 0
             sentence_embeddings = sentenceModel.encode(allSentences[idi],show_progress_bar = False)
             sentence_embeddings = torch.FloatTensor(sentence_embeddings).unsqueeze(0).permute(1,2,0)
             summary_representation=[]
-            for idj, j in  enumerate(i):
+            for idj, j in  enumerate(i[:len(allSentences[idi])]):
                 # print(f'========{idj}==========')
-                sample = np.argmax(scores[idi])
+                sample = np.argmax(scores)
                 # print(f'sample {sample}')
                 # print(f'scores[idi] {scores[idi]}')
                 summary_j.append(allSentences[idi][sample])
@@ -549,13 +621,12 @@ class Trainer(object):
                 summary_representation.append(sentence_embeddings[sample])
 
                 s = torch.stack(summary_representation,1).permute(2,0,1)
-                #print(s)
-                #print(f'sentence_embeddings.shape {sentence_embeddings.shape}')
-                #print(f's.shape {s.shape}')
+            
                 redundancy_score =torch.max(F.cosine_similarity(sentence_embeddings,s,1),1)[0].cpu().numpy()
-                scores = lamb*sent_scores - ((1-lamb)*redundancy_score) + (1-lamb)
+                
+                scores = lamb*scores_importance - ((1-lamb)*redundancy_score) + (1-lamb)
                 for i_sel in selected_j:
-                    scores[idi][i_sel] = 0
+                    scores[i_sel] = 0
                 sent_limit += 1
                 if sent_limit == 3 : break
             summary.append(summary_j)
@@ -564,19 +635,8 @@ class Trainer(object):
 
     # this fucntion from https://github.com/Wendy-Xiao/redundancy_reduction_longdoc
     def __get_rouge_single(self, hyp,ref):
-        # avg_fs_result = []
         avg_fs_result_155 = []
         hyp_tmp = hyp.copy()
-        # for i in hyp:
-        #     hyp = '\n'.join(i)
-        #     evaluator = rouge.Rouge(metrics=['rouge-n','rouge-l'], max_n=2, limit_length=False,apply_avg=False,apply_best=False)
-        #     scores = evaluator.get_scores(hyp,ref)
-        #     f1 = np.array(scores['rouge-1'][0]['f'])
-        #     f2 = np.array(scores['rouge-2'][0]['f'])
-        #     fl = np.array(scores['rouge-l'][0]['f'])
-        #     avg_fs = np.mean([f1,f2,fl],0)
-        #     avg_fs_result.append(avg_fs)
-
         can_path = '%s_.candidate' % (self.args.result_path)
         gold_path = '%s_.gold' % (self.args.result_path)
 
@@ -597,26 +657,18 @@ class Trainer(object):
         return np.array(avg_fs_result_155)
 
     def _loss_compute(self, allSentences,sent_scores,reference,sent_scores_size,sentenceModel):
-        # reward_batch = torch.zeros(sent_scores_size[1])
-        rl_label_batch = torch.zeros(sent_scores_size[:2])
+        
+        rl_label_batch = torch.zeros(sent_scores_size)
 
         result,selected = self._greedy_nommr(sent_scores,allSentences)
         result_mmr ,selected_mmr = self._mmr_select(sent_scores,allSentences,sentenceModel)
         reward_greedy = self.__get_rouge_single(result,reference)
         reward_mmr = self.__get_rouge_single(result_mmr,reference)
-        # print(f'rl_label_batch {rl_label_batch.size()}')
-        # print(f'selected_mmr {selected_mmr}')
+        
         for idx,i in enumerate(zip(selected_mmr)):
             rl_label_batch[idx,i] = 1
 
-
-        # print(f'rl_label_batch {rl_label_batch}')
-   
-        # print(f'greedy: {result,selected}')
-        # print(f'mmr: {result_mmr,selected_mmr}')
-
-        # print(reward_greedy[0]-reward_mmr[0])
-        reward = reward_mmr-reward_greedy
+        reward = reward_greedy-reward_mmr
         reward = torch.FloatTensor(reward)
         reward.requires_grad_(False)
         return  reward, rl_label_batch
@@ -630,7 +682,6 @@ class Trainer(object):
             if self.grad_accum_count == 1:
                 self.model.zero_grad()
 
-            #logger.info(f'batch: {batch.src_str}')
             src = batch.src
             labels = batch.src_sent_labels
             
@@ -646,10 +697,6 @@ class Trainer(object):
                 sent_scores_np = -np.sort(-sent_scores_np, 1)
                 allSentences_list = []
                 for i, idx in enumerate(selected_ids):
-                    # logger.info(f'len(batch.src_str[i]): {len(batch.src_str[i])}')
-                    # logger.info(f'selected_ids[i]: {selected_ids[i]}')
-                    # logger.info(f'selected_ids[i][:len(batch.src_str[i])]: {selected_ids[i][:len(batch.src_str[i])]}')
-                    
                     allSentences = []
                     if (len(batch.src_str[i]) == 0): continue
                     for j in selected_ids[i][:len(batch.src_str[i])]: #loop each candidate sentence 
@@ -657,51 +704,48 @@ class Trainer(object):
                         candidate = batch.src_str[i][j].strip() 
                         allSentences.append(candidate)
                     allSentences_list.append(allSentences)
-                
-                # logger.info(f'batch.src_str: {batch.src_str[i]}')
-                # logger.info(f'sent_scores: {sent_scores_np.shape}')
-                # logger.info(f'allSentences: {allSentences}')
-                # logger.info(f'labels: {labels}')
-                # logger.info(f'labels: {batch.tgt_str}')
-                    
-                
-                # logger.info(f'sent_scores: {sent_scores}') # [[0.3237, 0.5695, 0.4251, 0.4078, 0.1652, 0.3770, 0.5206, 0.5282, 0.6333, 0.6573, 0.6338, 0.6922, 0.7432, 0.6689, 0.5860, 0.4160, 0.3242, 0.4360
-                # logger.info(f'mask: {mask}') # tensor([[1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.,1., 1., 1.]
-                # logger.info(f'batch.src_str: {batch.src_str}') # whole document
-                # logger.info(f'batch.src_str: {batch.tgt_str}') # whole summary
-                
-                    
+            
+                  
+
                 reward,rl_label = self._loss_compute(allSentences_list,sent_scores_np,batch.tgt_str,sent_scores.size(),sentenceModel)
                 if torch.cuda.is_available(): 
                     rl_label = rl_label.to(self.gpu_rank)
-                    reward = rl_label.to(self.gpu_rank)
-                # print(f'reward{ reward}')
+                    reward = reward.reshape(sent_scores.shape[0], 1)
+                    reward = reward.to(self.gpu_rank)
+                else: reward = reward.reshape(sent_scores.shape[0], 1)
                 labels_float = labels.float() # it's label in redundancy paper
                 mask_new = labels.gt(-1).float()
-                loss_ce = F.binary_cross_entropy_with_logits(sent_scores,labels_float,weight = mask_new,reduction='none',pos_weight= self.__posweight)                
-                # print(f'loss_ce{loss_ce}')
-                mask_new = mask_new*reward
-                loss_rd = F.binary_cross_entropy_with_logits(sent_scores,rl_label,weight = mask_new,reduction='none',pos_weight= self.__posweight)
                 
-                # print(f'loss_ce, loss_rd {loss_ce, loss_rd}')
-                gamma = 0.99
+                loss_ce = F.binary_cross_entropy(sent_scores,labels_float,weight = mask_new,reduction='sum')                
+                try:
+                    mask_new = mask_new*reward
+                except Exception as e:
+                    print(e)
+                    print(f'sent_scores {sent_scores.shape}')
+                    print(f'reward {reward.shape}')
+                    print(f'mask_new {mask_new.shape}')
+                    exit()
+                loss_rd = F.binary_cross_entropy(sent_scores,rl_label,weight = mask_new,reduction='sum')
+                gamma = self.args.gamma
+
                 loss = (1-gamma)*loss_ce+gamma*loss_rd
+                loss.backward()
+                batch_stats = Statistics(loss = float(loss.cpu().data.numpy()),
+                                        loss_ce = float(loss_ce.cpu().data.numpy()),
+                                        loss_rd = float(loss_rd.cpu().data.numpy()),
+                                        n_docs = normalization,is_mmr_select_plus = True) # normalization is n_docs
+                total_stats.update(batch_stats)
+                report_stats.update(batch_stats)
+                
             else: 
                 loss = self.loss(sent_scores, labels.float())
-            
-            
-            
-            
-            loss = (loss * mask.float()).sum() # like reduction='sum' in F.binary_cross_entropy_with_logits
-            (loss / loss.numel()).backward()
+                loss = (loss * mask.float()).sum() # like reduction='sum' in F.binary_cross_entropy_with_logits
+                (loss / loss.numel()).backward()
 
-            # logger.info("Numbers in sent_scores are: {}".format(' '.join(map(str, sent_scores))))
-            # logger.info("Numbers in mask are: {}".format(' '.join(map(str, mask))))
-
-            batch_stats = Statistics(float(loss.cpu().data.numpy()), normalization) # normalization is n_docs
-            total_stats.update(batch_stats)
-            report_stats.update(batch_stats)
-
+                batch_stats = Statistics(float(loss.cpu().data.numpy()), n_docs = normalization) # normalization is n_docs
+                total_stats.update(batch_stats)
+                report_stats.update(batch_stats)
+            
             # 4. Update the parameters and statistics.
             if self.grad_accum_count == 1:
                 # Multi GPU gradient gather
@@ -771,7 +815,7 @@ class Trainer(object):
         return stat
 
     def _maybe_report_training(self, step, num_steps, learning_rate,
-                               report_stats):
+                               report_stats,is_mmr_select_plus = False):
         """
         Simple function to report training stats (if report_manager is set)
         see `onmt.utils.ReportManagerBase.report_training` for doc
@@ -779,7 +823,7 @@ class Trainer(object):
         if self.report_manager is not None:
             return self.report_manager.report_training(
                 step, num_steps, learning_rate, report_stats,
-                multigpu=self.n_gpu > 1)
+                multigpu=self.n_gpu > 1,is_mmr_select_plus = is_mmr_select_plus)
 
     def _report_step(self, learning_rate, step, train_stats=None,
                      valid_stats=None):

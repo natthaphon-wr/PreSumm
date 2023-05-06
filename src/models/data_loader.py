@@ -55,14 +55,6 @@ class Batch(object):
             
             if (is_test):
                 src_str = [x[-2] for x in data]
-                # print(f'clss {clss}')
-                # old = 0
-                # for i in clss[0]:
-                #     print(old,int(i))
-                #     print(f'{src_str[0][old:int(i)]}')
-                #     old = int(i)
-                
-                # exit()
                 setattr(self, 'src_str', src_str)
                 tgt_str = [x[-1] for x in data]
                 setattr(self, 'tgt_str', tgt_str)
@@ -97,6 +89,12 @@ def load_dataset(args, corpus_type, shuffle, verbose = True):
     if pts:
         if (shuffle):
             random.shuffle(pts)
+        
+        if args.last_trained_data != -1:
+            train_set = [int(pt.split('train.')[-1].split('.')[0]) for pt in pts]
+            last_index = train_set.index(args.last_trained_data)
+            pts = pts[last_index+1:]
+            logger.info(f'Remove trained data: {train_set[:last_index+1]}')
 
         for pt in pts:
             yield _lazy_dataset_loader(pt, corpus_type)
